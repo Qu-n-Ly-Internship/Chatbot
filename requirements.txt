@@ -1,0 +1,17 @@
+fastapi>=0.109.0
+uvicorn>=0.27.0
+python-dotenv>=1.0.1
+# Các thư viện lõi của LangChain
+langchain>=0.1.10
+langchain-community>=0.0.25
+langchain-core>=0.1.28
+langchain-google-genai>=1.0.0
+# Để pip tự chọn bản phù hợp nhất cho chroma
+langchain-chroma
+chromadb>=0.4.24
+# Database
+mysql-connector-python>=8.3.0
+sqlalchemy>=2.0.27
+# Hỗ trợ search
+rank_bm25>=0.2.2
+pydantic>=2.6.1
