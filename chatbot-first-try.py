@@ -7,7 +7,6 @@ import uuid
 from typing import List, Optional
 from contextlib import asynccontextmanager
 
-# --- 1. IMPORTS ---
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -22,7 +21,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.chat_message_histories import ChatMessageHistory
 
-# --- 2. CONFIG ---
+# --- CONFIG ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 load_dotenv(ENV_PATH)
@@ -45,10 +44,13 @@ DATA_DIR = os.path.join(BASE_DIR, "internship-dataset")
 
 vectorstore = None
 llm = None
+prompt_template = None
+chain = None
 session_store = {}
 db_engine = None
+RETRIEVER_K = int(os.getenv("RETRIEVER_K", "8"))
 
-# --- 3. LIFESPAN ---
+# --- LIFESPAN ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print(f"🐍 Python: {sys.executable}")
@@ -58,15 +60,15 @@ async def lifespan(app: FastAPI):
     yield
     print("🛑 Server shutting down...")
 
-app = FastAPI(title="Internship Chatbot API (Null User Fix)", version="3.1.0", lifespan=lifespan)
+app = FastAPI(title="Internship Chatbot API", version="3.1.0", lifespan=lifespan)
 
-# --- 4. MODELS (ĐÃ SỬA USER_ID THÀNH OPTIONAL) ---
+# --- MODELS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",    # React default
-        "http://localhost:5173",    # Vite default
-        "http://localhost:5174",    # Vite alternative
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:5174",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:5173",
     ],
@@ -76,9 +78,8 @@ app.add_middleware(
 )
 
 class ChatRequest(BaseModel):
-    # Cho phép user_id là null (None). Mặc định là None.
-    user_id: Optional[int] = None 
-    conversation_id: Optional[str] = None 
+    user_id: Optional[int] = None
+    conversation_id: Optional[str] = None
     question: str
 
 class ChatResponse(BaseModel):
@@ -86,7 +87,7 @@ class ChatResponse(BaseModel):
     answer: str
     sources: List[str]
 
-# --- 5. DATABASE HELPERS ---
+# --- DATABASE HELPERS ---
 def init_db_engine():
     global db_engine
     try:
@@ -98,31 +99,27 @@ def init_db_engine():
         db_engine = None
 
 def save_chat_history(user_id: Optional[int], conversation_id: str, user_request: str, gemini_response: str):
-    if not db_engine: return
-    
-    # XỬ LÝ AN TOÀN: Nếu user_id là None, lưu là 0 (để tránh lỗi DB nếu cột đó NOT NULL)
-    # Nếu DB của bạn cho phép NULL, bạn có thể thay số 0 bằng None
-    safe_user_id = user_id if user_id is not None else 0
+    if not db_engine:
+        return
 
     query = text("""
         INSERT INTO chat_history (user_id, conversation_id, user_request, gemini_response, created_at)
         VALUES (:uid, :cid, :req, :res, :time)
     """)
     try:
-        with db_engine.connect() as conn:
+        with db_engine.begin() as conn:
             conn.execute(query, {
-                "uid": safe_user_id, 
-                "cid": conversation_id, 
+                "uid": user_id,  # None nếu chưa có user
+                "cid": conversation_id,
                 "req": user_request,
-                "res": gemini_response, 
+                "res": gemini_response,
                 "time": datetime.datetime.now()
             })
-            conn.commit()
-            print(f"💾 Saved log for User {safe_user_id} / Session: {conversation_id}")
+        print(f"💾 Saved log for User {user_id} / Session: {conversation_id}")
     except Exception as e:
         print(f"❌ DB Save Error: {e}")
 
-# --- 6. RAG LOGIC ---
+# --- RAG LOGIC ---
 def get_session_history(session_id: str):
     if session_id not in session_store:
         session_store[session_id] = ChatMessageHistory()
@@ -130,119 +127,163 @@ def get_session_history(session_id: str):
 
 def load_and_process_documents():
     global vectorstore
-    if not GENAI_API_KEY: return
-
+    if not GENAI_API_KEY:
+        print("⚠️ GENAI_API_KEY not set — skipping embeddings & vectorstore load.")
+        return
     embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=GENAI_API_KEY)
 
-    if os.path.exists(VECTOR_DB_DIR) and os.path.isdir(VECTOR_DB_DIR) and os.listdir(VECTOR_DB_DIR):
-        print("📂 Loading VectorStore...")
-        try:
+    # Try load from disk first
+    try:
+        if os.path.exists(VECTOR_DB_DIR) and os.path.isdir(VECTOR_DB_DIR) and os.listdir(VECTOR_DB_DIR):
+            print("📂 Loading VectorStore from disk...")
             vectorstore = Chroma(persist_directory=VECTOR_DB_DIR, embedding_function=embeddings)
+            return
+    except Exception as e:
+        print(f"⚠️ Error loading vectorstore from disk: {e}")
+        vectorstore = None
+
+    print("🚀 Creating VectorStore from documents...")
+    if not os.path.exists(DATA_DIR):
+        print(f"⚠️ DATA_DIR does not exist: {DATA_DIR}")
+        return
+
+    documents = []
+    files = []
+    for ext in ["*.txt", "*.md"]:
+        files.extend(glob.glob(os.path.join(DATA_DIR, "**", ext), recursive=True))
+
+    for fpath in files:
+        try:
+            loader = TextLoader(fpath, encoding="utf-8")
+            docs = loader.load()
         except Exception:
-            vectorstore = None
-    else:
-        print("🚀 Creating VectorStore...")
-        documents = []
-        if not os.path.exists(DATA_DIR): return
-
-        files = []
-        for ext in ["*.txt", "*.md"]:
-            files.extend(glob.glob(os.path.join(DATA_DIR, "**", ext), recursive=True))
-        
-        for f in files:
             try:
-                loader = TextLoader(f, encoding="utf-8")
-                documents.extend(loader.load())
+                loader = TextLoader(fpath, encoding="latin-1")
+                docs = loader.load()
             except Exception:
-                try:
-                    loader = TextLoader(f, encoding="latin-1")
-                    documents.extend(loader.load())
-                except Exception:
-                    pass
+                print(f"⚠️ Failed to load file: {fpath}")
+                docs = []
 
-        if not documents: return
+        for d in docs:
+            if not hasattr(d, "metadata") or d.metadata is None:
+                d.metadata = {}
+            d.metadata["source"] = fpath
+        documents.extend(docs)
 
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        splits = text_splitter.split_documents(documents)
+    if not documents:
+        print("⚠️ No documents loaded.")
+        return
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splits = text_splitter.split_documents(documents)
+
+    for s in splits:
+        if not hasattr(s, "metadata") or s.metadata is None:
+            s.metadata = {}
+        if "source" not in s.metadata:
+            s.metadata["source"] = "unknown"
+
+    try:
         vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings, persist_directory=VECTOR_DB_DIR)
+        print("✅ VectorStore created and persisted.")
+    except Exception as e:
+        print(f"❌ Failed to create vectorstore: {e}")
+        vectorstore = None
 
-def simple_retriever(query: str, k: int = 4):
-    if not vectorstore: return []
+def simple_retriever(query: str, k: int = RETRIEVER_K):
+    if not vectorstore:
+        return []
     try:
         return vectorstore.similarity_search(query, k=k)
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Retriever error: {e}")
         return []
 
 def setup_chain():
-    global llm
-    if not GENAI_API_KEY: return None
-    
+    global llm, prompt_template, chain
+    if not GENAI_API_KEY:
+        print("⚠️ GENAI_API_KEY not set — cannot initialize LLM.")
+        return None
+
     models_to_try = ["gemini-2.5-flash", "gemini-2.5-flash-latest", "gemini-pro"]
     for model_name in models_to_try:
         try:
-            llm_candidate = ChatGoogleGenerativeAI(model=model_name, temperature=0.3, google_api_key=GENAI_API_KEY)
-            llm_candidate.invoke("Hi")
-            llm = llm_candidate
+            candidate = ChatGoogleGenerativeAI(model=model_name, temperature=0.3, google_api_key=GENAI_API_KEY)
+            candidate.invoke("Hi")
+            llm = candidate
             print(f"✅ Model selected: {model_name}")
             break
-        except Exception:
+        except Exception as e:
+            print(f"ℹ️ Model {model_name} failed: {e}")
             continue
-    
-    if not llm: return None
-    
+
+    if not llm:
+        print("❌ No model available (all candidates failed).")
+        return None
+
     system_prompt = (
-        "Bạn là chuyên gia tư vấn thực tập sinh. "
-        "Context:\n{context}"
+        "Bạn là trợ lý RAG (Retrieval-Augmented Generation).\n"
+        "- Trả lời chỉ dựa trên {context}.\n"
+        "- KHÔNG bịa, thêm, hoặc suy đoán nếu không có trong context.\n"
+        "- Nếu context trống, trả lời xã giao tự nhiên hoặc nói 'Tôi không tìm thấy thông tin trong tài liệu.'\n"
+        "- Nếu nhiều nguồn, trích dẫn tên file (metadata.source).\n"
     )
-    prompt = ChatPromptTemplate.from_messages([
+
+    prompt_template = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         MessagesPlaceholder(variable_name="history"),
-        ("human", "{input}"),
+        ("human", "{input}")
     ])
-    return prompt
 
-# --- 7. API ENDPOINT ---
+    try:
+        chain = prompt_template | llm | StrOutputParser()
+        print("✅ Chain initialized.")
+    except Exception as e:
+        print(f"⚠️ Failed to initialize chain: {e}")
+        chain = None
+
+    return chain
+
+# --- API ENDPOINT ---
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
-    if not llm:
+    global chain
+
+    if not llm or not chain:
         raise HTTPException(status_code=503, detail="AI System not ready")
 
-    current_conversation_id = request.conversation_id
-    if not current_conversation_id or current_conversation_id.strip() == "":
-        current_conversation_id = str(uuid.uuid4())
-        print(f"🆕 New Session (Anonymous): {current_conversation_id}")
-    else:
-        print(f"🔄 Resume Session: {current_conversation_id}")
+    current_conversation_id = request.conversation_id or str(uuid.uuid4())
+    print(f"Session: {current_conversation_id}")
 
-    docs = simple_retriever(request.question)
-    context_text = "\n\n".join([d.page_content for d in docs])
-    sources = list(set([d.metadata.get("source", "unknown") for d in docs]))
+    docs = simple_retriever(request.question, k=RETRIEVER_K)
+    context_text = "\n\n".join([d.page_content for d in docs]) if docs else ""
+    sources = list({d.metadata.get("source", "unknown") for d in docs}) if docs else []
 
     history = get_session_history(current_conversation_id)
-    prompt_template = setup_chain()
-    chain = prompt_template | llm | StrOutputParser()
 
-    response_text = chain.invoke({
-        "context": context_text,
-        "history": history.messages,
-        "input": request.question
-    })
+    # If no context, return friendly fallback
+    if not context_text.strip():
+        fallback_msg = "Xin chào! Mình sẵn sàng hỗ trợ bạn. (Không tìm thấy thông tin trong tài liệu)"
+        history.add_user_message(request.question)
+        history.add_ai_message(fallback_msg)
+        save_chat_history(request.user_id, current_conversation_id, request.question, fallback_msg)
+        return ChatResponse(conversation_id=current_conversation_id, answer=fallback_msg, sources=[])
+
+    try:
+        response_text = chain.invoke({
+            "context": context_text,
+            "history": history.messages,
+            "input": request.question
+        })
+    except Exception as e:
+        print(f"❌ Chain invocation error: {e}")
+        response_text = "Xin lỗi, hệ thống gặp lỗi. Vui lòng thử lại sau."
 
     history.add_user_message(request.question)
     history.add_ai_message(response_text)
+    save_chat_history(request.user_id, current_conversation_id, request.question, response_text)
 
-    save_chat_history(
-        user_id=request.user_id, # Có thể là None
-        conversation_id=current_conversation_id,
-        user_request=request.question,
-        gemini_response=response_text
-    )
-
-    return ChatResponse(
-        conversation_id=current_conversation_id,
-        answer=response_text, 
-        sources=sources
-    )
+    return ChatResponse(conversation_id=current_conversation_id, answer=response_text, sources=sources)
 
 if __name__ == "__main__":
     import uvicorn
